@@ -32,6 +32,8 @@ struct JPlayCtl {
             exit(clickTransportButton(matching: ["Next"]) ? 0 : 1)
         case "prev":
             exit(clickTransportButton(matching: ["Previous"]) ? 0 : 1)
+        case "toggle-like":
+            exit(clickFavoriteButton() ? 0 : 1)
         case "status":
             printStatus()
             exit(0)
@@ -59,13 +61,14 @@ struct JPlayCtl {
         JPlay CLI - Control JPlay (UPnP Player) via macOS accessibility APIs.
 
         Usage:
-          jplay-ctl [-v] play      Toggle play/pause
-          jplay-ctl [-v] next      Next track
-          jplay-ctl [-v] prev      Previous track
-          jplay-ctl status         Show current state
+          jplay-ctl [-v] play         Toggle play/pause
+          jplay-ctl [-v] next         Next track
+          jplay-ctl [-v] prev         Previous track
+          jplay-ctl [-v] toggle-like  Toggle favorite
+          jplay-ctl status            Show current state
 
         Options:
-          -v, --verbose    Show debug output
+          -v, --verbose  Show debug output
         """)
     }
 
@@ -156,6 +159,134 @@ struct JPlayCtl {
 
         fputs("error: Button not found\n", stderr)
         return false
+    }
+
+    static func clickFavoriteButton() -> Bool {
+        guard let window = findJPlayWindow() else {
+            return false
+        }
+
+        // Favorite button descriptions (changes based on state)
+        let descriptions = [
+            "Not Favorite, tap to mark as favorite.",
+            "Is Favorite, tap to unfavorite."
+        ]
+
+        // Try direct paths first
+        if let (button, path) = tryFavoritePath(window: window) {
+            debug("using favorite path '\(path)'")
+            let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
+            if result == .success {
+                return true
+            }
+        }
+
+        // Fallback to recursive search
+        debug("falling back to recursive search for favorite")
+        if let button = findFavoriteButton(in: window, matching: descriptions) {
+            let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
+            if result == .success {
+                return true
+            } else {
+                fputs("error: Failed to press favorite button (code: \(result.rawValue))\n", stderr)
+                return false
+            }
+        }
+
+        fputs("error: Favorite button not found\n", stderr)
+        return false
+    }
+
+    static func tryFavoritePath(window: AXUIElement) -> (AXUIElement, String)? {
+        let descriptions = [
+            "Not Favorite, tap to mark as favorite.",
+            "Is Favorite, tap to unfavorite."
+        ]
+
+        // Path 1: Album view - transport bar favorite button
+        // Near transport at [0, 0, 3], favorite is likely a sibling
+        if let group = followPath(window, path: [0, 0, 3]) {
+            // Scan for favorite button in this group
+            if let button = findButtonInGroupByDesc(group, matching: descriptions) {
+                return (button, "album")
+            }
+        }
+
+        // Path 2: Now Playing - favorite near transport at [0,0,1,0,6]
+        // Check parent group [0,0,1,0] for favorite
+        if let group = followPath(window, path: [0, 0, 1, 0]) {
+            if let button = findButtonInGroupByDesc(group, matching: descriptions) {
+                return (button, "nowplaying")
+            }
+        }
+
+        return nil
+    }
+
+    static func findButtonInGroupByDesc(_ group: AXUIElement, matching descriptions: [String]) -> AXUIElement? {
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(group, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else {
+            return nil
+        }
+        // Check all children (including nested)
+        for child in children {
+            if isButtonWithDesc(child, matching: descriptions) {
+                return child
+            }
+            // Check one level of nesting
+            var nestedRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(child, kAXChildrenAttribute as CFString, &nestedRef) == .success,
+               let nested = nestedRef as? [AXUIElement] {
+                for nestedChild in nested {
+                    if isButtonWithDesc(nestedChild, matching: descriptions) {
+                        return nestedChild
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    static func findFavoriteButton(in element: AXUIElement, matching descriptions: [String]) -> AXUIElement? {
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String,
+           role == kAXButtonRole as String {
+
+            var descRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef) == .success,
+               let desc = descRef as? String,
+               descriptions.contains(desc) {
+
+                // Filter by size: transport bar favorite is ~27x20
+                // Track list favorites are 18x45/59 (taller than wide)
+                var sizeRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+                   let sizeValue = sizeRef {
+                    var size = CGSize.zero
+                    if AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
+                        // Accept buttons that are wider than tall (transport bar style)
+                        // or small square-ish buttons (22x22)
+                        if size.width >= size.height || (size.width >= 20 && size.width <= 30 && size.height <= 30) {
+                            return element
+                        }
+                    }
+                }
+            }
+        }
+
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                if let found = findFavoriteButton(in: child, matching: descriptions) {
+                    return found
+                }
+            }
+        }
+
+        return nil
     }
 
     static func getChild(_ element: AXUIElement, at index: Int) -> AXUIElement? {
