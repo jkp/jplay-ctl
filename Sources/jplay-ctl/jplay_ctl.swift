@@ -3,14 +3,27 @@ import Cocoa
 
 @main
 struct JPlayCtl {
+    static var verbose = false
+
+    static func debug(_ message: String) {
+        if verbose {
+            fputs("debug: \(message)\n", stderr)
+        }
+    }
+
     static func main() {
-        let args = CommandLine.arguments
-        guard args.count >= 2 else {
+        var args = Array(CommandLine.arguments.dropFirst())
+
+        // Check for -v/--verbose flag
+        if let idx = args.firstIndex(where: { $0 == "-v" || $0 == "--verbose" }) {
+            verbose = true
+            args.remove(at: idx)
+        }
+
+        guard let command = args.first else {
             printUsage()
             exit(1)
         }
-
-        let command = args[1]
 
         switch command {
         case "play":
@@ -46,10 +59,13 @@ struct JPlayCtl {
         JPlay CLI - Control JPlay (UPnP Player) via macOS accessibility APIs.
 
         Usage:
-          jplay-ctl play      Toggle play/pause
-          jplay-ctl next      Next track
-          jplay-ctl prev      Previous track
-          jplay-ctl status    Show current state
+          jplay-ctl [-v] play      Toggle play/pause
+          jplay-ctl [-v] next      Next track
+          jplay-ctl [-v] prev      Previous track
+          jplay-ctl status         Show current state
+
+        Options:
+          -v, --verbose    Show debug output
         """)
     }
 
@@ -118,7 +134,8 @@ struct JPlayCtl {
         }
 
         // Try direct paths in order (fastest first)
-        if let (button, _) = tryDirectPath(window: window, buttonOffset: buttonOffset) {
+        if let (button, path) = tryDirectPath(window: window, buttonOffset: buttonOffset) {
+            debug("using direct path '\(path)'")
             let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
             if result == .success {
                 return true
@@ -126,6 +143,7 @@ struct JPlayCtl {
         }
 
         // Fallback to recursive search
+        debug("falling back to recursive search")
         if let button = findTransportButton(in: window, matching: descriptions) {
             let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
             if result == .success {
@@ -182,7 +200,17 @@ struct JPlayCtl {
     static func tryDirectPath(window: AXUIElement, buttonOffset: Int) -> (AXUIElement, String)? {
         let targetDesc = buttonOffset == -1 ? ["Previous"] : buttonOffset == 1 ? ["Next"] : ["Play", "Pause"]
 
-        // Path 1: Lounge - Group[0] > Group[0] > Button[9/10/11]
+        // Path 1: Album view - transport bar at bottom
+        // Group[0] > Group[0] > Group[3] > Button[1/2/3]
+        if let group = followPath(window, path: [0, 0, 3]) {
+            let buttonIndex = 2 + buttonOffset  // Prev=1, Play=2, Next=3
+            if let button = getChild(group, at: buttonIndex),
+               isButtonWithDesc(button, matching: targetDesc) {
+                return (button, "album")
+            }
+        }
+
+        // Path 2: Lounge - Group[0] > Group[0] > Button[9/10/11]
         if let group = followPath(window, path: [0, 0]) {
             let buttonIndex = 10 + buttonOffset
             if let button = getChild(group, at: buttonIndex),
@@ -191,7 +219,7 @@ struct JPlayCtl {
             }
         }
 
-        // Path 2: Now Playing - Group[0] > Group[0] > Group[1] > Group[0] > Group[6] > Button[0/1/2]
+        // Path 3: Now Playing - Group[0] > Group[0] > Group[1] > Group[0] > Group[6] > Button[0/1/2]
         if let group = followPath(window, path: [0, 0, 1, 0, 6]) {
             let buttonIndex = 1 + buttonOffset
             if let button = getChild(group, at: buttonIndex),
@@ -200,9 +228,8 @@ struct JPlayCtl {
             }
         }
 
-        // Path 3: Default mini bar - two possible structures
-        // Try: Group[0] > Group[0] > Group[1] > Group[0] > Group[0] > Group[0] > Group[1]
-        // Trace showed Play at Button[0], so scan siblings for matching button
+        // Path 4: Default mini bar
+        // Group[0] > Group[0] > Group[1] > Group[0] > Group[0] > Group[0] > Group[1]
         if let group = followPath(window, path: [0, 0, 1, 0, 0, 0, 1]) {
             if let button = findButtonInGroup(group, matching: targetDesc) {
                 return (button, "default")
@@ -356,6 +383,11 @@ struct JPlayCtl {
             return
         }
 
+        guard startIndex < children.count else {
+            print("  (startIndex \(startIndex) exceeds \(children.count) children)")
+            return
+        }
+
         let endIndex = min(startIndex + count, children.count)
         for i in startIndex..<endIndex {
             let child = children[i]
@@ -408,14 +440,15 @@ struct JPlayCtl {
                let desc = descRef as? String,
                descriptions.contains(desc) {
 
-                // Verify it's a reasonable button size (not tiny icons)
+                // Verify it's a transport button by size:
+                // - Min 25px (filters out tiny 12x14 icons)
+                // - Max 50px width (filters out album Play button which is 85px)
                 var sizeRef: CFTypeRef?
                 if AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
                    let sizeValue = sizeRef {
                     var size = CGSize.zero
                     if AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
-                        // Accept buttons >= 25px (filters out tiny 12x14 icons)
-                        if size.width >= 25 && size.height >= 20 {
+                        if size.width >= 25 && size.width <= 50 && size.height >= 20 {
                             return element
                         }
                     }
