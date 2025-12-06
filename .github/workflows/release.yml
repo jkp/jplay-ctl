@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build for arm64
+        run: |
+          swift build -c release --arch arm64
+          mv .build/release/jplay-ctl jplay-ctl-darwin-arm64
+
+      - name: Build for x86_64
+        run: |
+          swift build -c release --arch x86_64
+          mv .build/release/jplay-ctl jplay-ctl-darwin-x86_64
+
+      - name: Create universal binary
+        run: |
+          lipo -create -output jplay-ctl-darwin-universal \
+            jplay-ctl-darwin-arm64 \
+            jplay-ctl-darwin-x86_64
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            jplay-ctl-darwin-arm64
+            jplay-ctl-darwin-x86_64
+            jplay-ctl-darwin-universal
+          generate_release_notes: true
