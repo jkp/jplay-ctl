@@ -2,39 +2,52 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  release:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for tags
 
-      - name: Build for arm64
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # Manual tag push - use the tag
+            VERSION="${{ github.ref_name }}"
+          else
+            # Push to main - auto-increment
+            LATEST=$(git tag -l 'v*' | sort -V | tail -n1)
+            if [[ -z "$LATEST" ]]; then
+              VERSION="v0.1.0"
+            else
+              # Increment patch: v0.1.5 -> v0.1.6
+              MAJOR=$(echo $LATEST | cut -d. -f1)
+              MINOR=$(echo $LATEST | cut -d. -f2)
+              PATCH=$(echo $LATEST | cut -d. -f3)
+              VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            fi
+            # Create and push the tag
+            git tag "$VERSION"
+            git push origin "$VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build
         run: |
           swift build -c release --arch arm64
           mv .build/release/jplay-ctl jplay-ctl-darwin-arm64
 
-      - name: Build for x86_64
-        run: |
-          swift build -c release --arch x86_64
-          mv .build/release/jplay-ctl jplay-ctl-darwin-x86_64
-
-      - name: Create universal binary
-        run: |
-          lipo -create -output jplay-ctl-darwin-universal \
-            jplay-ctl-darwin-arm64 \
-            jplay-ctl-darwin-x86_64
-
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            jplay-ctl-darwin-arm64
-            jplay-ctl-darwin-x86_64
-            jplay-ctl-darwin-universal
+          tag_name: ${{ steps.version.outputs.version }}
+          files: jplay-ctl-darwin-arm64
           generate_release_notes: true
