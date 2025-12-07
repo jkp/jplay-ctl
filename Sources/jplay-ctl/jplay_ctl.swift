@@ -1,6 +1,217 @@
 import ApplicationServices
 import Cocoa
 
+// MARK: - Actions & View Protocol
+
+enum JPlayAction: CaseIterable {
+    case play, next, prev, toggleLike, search
+}
+
+protocol JPlayView {
+    static func matches(window: AXUIElement) -> Bool
+    func canPerform(_ action: JPlayAction, window: AXUIElement) -> Bool
+    func perform(_ action: JPlayAction, window: AXUIElement) -> Bool
+    func escape(window: AXUIElement) -> Bool
+}
+
+// MARK: - Views
+
+/// Search view - has text field, NO large transport, NO 646 element
+struct SearchView: JPlayView {
+    static func matches(window: AXUIElement) -> Bool {
+        // Must have text field
+        guard JPlayCtl.findTextField(in: window) != nil else { return false }
+        // Must NOT have large transport (that's NowPlaying/Sofa)
+        guard !JPlayCtl.hasLargeTransport(in: window) else { return false }
+        // Must NOT have 646x646 element (that's Sofa)
+        guard !SofaView.has646Element(window: window) else { return false }
+        return true
+    }
+
+    func canPerform(_ action: JPlayAction, window: AXUIElement) -> Bool {
+        true  // Has mini transport + search field
+    }
+
+    func perform(_ action: JPlayAction, window: AXUIElement) -> Bool {
+        switch action {
+        case .play:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Play", "Pause"])
+        case .next:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Next"])
+        case .prev:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Previous"])
+        case .toggleLike:
+            return JPlayCtl.clickFavoriteInWindow(window)
+        case .search:
+            // Focus the search text field by clicking it
+            if let textField = JPlayCtl.findTextField(in: window) {
+                if AXUIElementPerformAction(textField, kAXPressAction as CFString) == .success {
+                    JPlayCtl.debug("clicked text field")
+                } else {
+                    AXUIElementSetAttributeValue(textField, kAXFocusedAttribute as CFString, true as CFTypeRef)
+                    JPlayCtl.debug("set focus attribute")
+                }
+                if let pid = JPlayCtl.findUPnPPlayerPID() {
+                    let app = NSRunningApplication(processIdentifier: pid)
+                    app?.activate(options: .activateIgnoringOtherApps)
+                }
+                return true
+            }
+            return false
+        }
+    }
+
+    func escape(window: AXUIElement) -> Bool {
+        false  // No escape needed
+    }
+}
+
+/// Library view - has Search button + small transport
+struct LibraryView: JPlayView {
+    static func matches(window: AXUIElement) -> Bool {
+        // Must have Search button (to navigate to search)
+        guard JPlayCtl.findButtonByDesc(in: window, matching: ["Search"]) != nil else {
+            return false
+        }
+        // And small transport (<=50px)
+        if let playBtn = JPlayCtl.findTransportButton(in: window, matching: ["Play", "Pause"]) {
+            var sizeRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(playBtn, kAXSizeAttribute as CFString, &sizeRef) == .success,
+               let sizeValue = sizeRef {
+                var size = CGSize.zero
+                if AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
+                    return size.width <= 50
+                }
+            }
+        }
+        return false
+    }
+
+    func canPerform(_ action: JPlayAction, window: AXUIElement) -> Bool {
+        switch action {
+        case .play, .next, .prev, .toggleLike:
+            return true
+        case .search:
+            return false  // Need to escape to SearchView first
+        }
+    }
+
+    func perform(_ action: JPlayAction, window: AXUIElement) -> Bool {
+        switch action {
+        case .play:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Play", "Pause"])
+        case .next:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Next"])
+        case .prev:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Previous"])
+        case .toggleLike:
+            return JPlayCtl.clickFavoriteInWindow(window)
+        case .search:
+            return false  // Handled by escape
+        }
+    }
+
+    func escape(window: AXUIElement) -> Bool {
+        // Click Search button to navigate to SearchView
+        if let btn = JPlayCtl.findButtonByDesc(in: window, matching: ["Search"]) {
+            return AXUIElementPerformAction(btn, kAXPressAction as CFString) == .success
+        }
+        return false
+    }
+}
+
+/// Now Playing view - has 27x33 chevron, large transport, no 646x646 element
+struct NowPlayingView: JPlayView {
+    static func matches(window: AXUIElement) -> Bool {
+        // Must have large transport (>50px) but NOT 646x646 element (that's Sofa)
+        guard !SofaView.has646Element(window: window) else { return false }
+        return JPlayCtl.hasLargeTransport(in: window)
+    }
+
+    func canPerform(_ action: JPlayAction, window: AXUIElement) -> Bool {
+        switch action {
+        case .play, .next, .prev, .toggleLike:
+            return true
+        case .search:
+            return false  // Need to escape first
+        }
+    }
+
+    func perform(_ action: JPlayAction, window: AXUIElement) -> Bool {
+        switch action {
+        case .play:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Play", "Pause"])
+        case .next:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Next"])
+        case .prev:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Previous"])
+        case .toggleLike:
+            return JPlayCtl.clickFavoriteInWindow(window)
+        case .search:
+            return false
+        }
+    }
+
+    func escape(window: AXUIElement) -> Bool {
+        // Click the chevron (27x33 no-desc button)
+        if let chevron = JPlayCtl.findFirstButtonNoDesc(in: window, width: 27, height: 33) {
+            return AXUIElementPerformAction(chevron, kAXPressAction as CFString) == .success
+        }
+        return false
+    }
+}
+
+/// Sofa view - has 646x646 element, large transport, CLEAR button (queue panel)
+struct SofaView: JPlayView {
+    static func matches(window: AXUIElement) -> Bool {
+        has646Element(window: window) && JPlayCtl.hasLargeTransport(in: window)
+    }
+
+    static func has646Element(window: AXUIElement) -> Bool {
+        var found = false
+        JPlayCtl.findElementBySize(in: window, width: 646, height: 646, tolerance: 5) { _ in
+            found = true
+        }
+        return found
+    }
+
+    func canPerform(_ action: JPlayAction, window: AXUIElement) -> Bool {
+        switch action {
+        case .play, .next, .prev, .toggleLike:
+            return true
+        case .search:
+            return false  // Need to escape first
+        }
+    }
+
+    func perform(_ action: JPlayAction, window: AXUIElement) -> Bool {
+        switch action {
+        case .play:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Play", "Pause"])
+        case .next:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Next"])
+        case .prev:
+            return JPlayCtl.clickTransportInWindow(window, matching: ["Previous"])
+        case .toggleLike:
+            return JPlayCtl.clickFavoriteInWindow(window)
+        case .search:
+            return false
+        }
+    }
+
+    func escape(window: AXUIElement) -> Bool {
+        // Click the X button (56x53 no-desc, 2nd after Renderer Selection)
+        var noDescButtons: [AXUIElement] = []
+        JPlayCtl.collectNoDescButtons(in: window, width: 56, height: 53, into: &noDescButtons)
+        if noDescButtons.count >= 2 {
+            return AXUIElementPerformAction(noDescButtons[1], kAXPressAction as CFString) == .success
+        }
+        return false
+    }
+}
+
+// MARK: - Main
+
 @main
 struct JPlayCtl {
     static var verbose = false
@@ -8,6 +219,135 @@ struct JPlayCtl {
     static func debug(_ message: String) {
         if verbose {
             fputs("debug: \(message)\n", stderr)
+        }
+    }
+
+    // MARK: - View Registry & Execute Loop
+
+    // Order matters: more specific views first
+    static let views: [JPlayView.Type] = [
+        SearchView.self,     // Has Cancel button + no large transport
+        SofaView.self,       // Has 646x646 element + large transport
+        NowPlayingView.self, // Has large transport (no 646x646)
+        LibraryView.self,    // Small transport (fallback)
+    ]
+
+    static func execute(_ action: JPlayAction, maxDepth: Int = 5, timeout: Double = 2.0) -> Bool {
+        for attempt in 0..<maxDepth {
+            guard let window = findJPlayWindow() else { return false }
+
+            // Find matching view
+            guard let viewType = views.first(where: { $0.matches(window: window) }) else {
+                debug("no view matched for attempt \(attempt)")
+                return false
+            }
+
+            let viewName = String(describing: viewType).replacingOccurrences(of: ".Type", with: "")
+            debug("matched \(viewName)")
+
+            let view = createView(viewType)
+
+            // Can perform action here?
+            if view.canPerform(action, window: window) {
+                debug("performing \(action) in \(viewName)")
+                return view.perform(action, window: window)
+            }
+
+            // Escape and poll until action becomes available
+            debug("escaping from \(viewName)")
+            guard view.escape(window: window) else {
+                debug("escape failed")
+                return false
+            }
+
+            guard waitUntilActionAvailable(action, timeout: timeout) else {
+                debug("timeout waiting for action")
+                return false
+            }
+        }
+        debug("max depth reached")
+        return false
+    }
+
+    static func createView(_ type: JPlayView.Type) -> JPlayView {
+        switch type {
+        case is SearchView.Type: return SearchView()
+        case is LibraryView.Type: return LibraryView()
+        case is NowPlayingView.Type: return NowPlayingView()
+        case is SofaView.Type: return SofaView()
+        default: fatalError("Unknown view type")
+        }
+    }
+
+    static func waitUntilActionAvailable(_ action: JPlayAction, timeout: Double) -> Bool {
+        let start = Date()
+        var pollCount = 0
+        while Date().timeIntervalSince(start) < timeout {
+            guard let window = findJPlayWindow() else { return false }
+            pollCount += 1
+            for viewType in views {
+                if viewType.matches(window: window) {
+                    let view = createView(viewType)
+                    if view.canPerform(action, window: window) {
+                        let viewName = String(describing: viewType).replacingOccurrences(of: ".Type", with: "")
+                        debug("poll \(pollCount): \(viewName) ready")
+                        return true
+                    }
+                    break
+                }
+            }
+            usleep(50000)  // 50ms poll
+        }
+        return false
+    }
+
+    // MARK: - View Helpers
+
+    static func clickTransportInWindow(_ window: AXUIElement, matching descriptions: [String]) -> Bool {
+        if let button = findTransportButton(in: window, matching: descriptions) {
+            return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
+        }
+        return false
+    }
+
+    static func clickFavoriteInWindow(_ window: AXUIElement) -> Bool {
+        let descriptions = [
+            "Not Favorite, tap to mark as favorite.",
+            "Is Favorite, tap to unfavorite."
+        ]
+        if let button = findFavoriteButton(in: window, matching: descriptions) {
+            return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
+        }
+        return false
+    }
+
+    static func hasLargeTransport(in window: AXUIElement) -> Bool {
+        var found = false
+        findButtonBySize(in: window, minWidth: 50, minHeight: 50, maxWidth: 70, maxHeight: 70) { _ in
+            found = true
+        }
+        return found
+    }
+
+    static func findElementBySize(in element: AXUIElement, width: Int, height: Int, tolerance: Int, callback: (AXUIElement) -> Void) {
+        var sizeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+           let sizeValue = sizeRef {
+            var size = CGSize.zero
+            if AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
+                if abs(Int(size.width) - width) <= tolerance && abs(Int(size.height) - height) <= tolerance {
+                    callback(element)
+                    return
+                }
+            }
+        }
+
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                findElementBySize(in: child, width: width, height: height, tolerance: tolerance, callback: callback)
+            }
         }
     }
 
@@ -27,13 +367,15 @@ struct JPlayCtl {
 
         switch command {
         case "play":
-            exit(clickTransportButton(matching: ["Play", "Pause"]) ? 0 : 1)
+            exit(execute(.play) ? 0 : 1)
         case "next":
-            exit(clickTransportButton(matching: ["Next"]) ? 0 : 1)
+            exit(execute(.next) ? 0 : 1)
         case "prev":
-            exit(clickTransportButton(matching: ["Previous"]) ? 0 : 1)
+            exit(execute(.prev) ? 0 : 1)
         case "toggle-like":
-            exit(clickFavoriteButton() ? 0 : 1)
+            exit(execute(.toggleLike) ? 0 : 1)
+        case "search":
+            exit(execute(.search) ? 0 : 1)
         case "status":
             printStatus()
             exit(0)
@@ -45,9 +387,6 @@ struct JPlayCtl {
             exit(0)
         case "trace":
             traceButtonPath()
-            exit(0)
-        case "inspect":
-            inspectGroup()
             exit(0)
         default:
             fputs("Unknown command: \(command)\n", stderr)
@@ -65,6 +404,7 @@ struct JPlayCtl {
           jplay-ctl [-v] next         Next track
           jplay-ctl [-v] prev         Previous track
           jplay-ctl [-v] toggle-like  Toggle favorite
+          jplay-ctl [-v] search       Focus search bar
           jplay-ctl status            Show current state
 
         Options:
@@ -121,130 +461,162 @@ struct JPlayCtl {
         return nil
     }
 
-    static func clickTransportButton(matching descriptions: [String]) -> Bool {
-        guard let window = findJPlayWindow() else {
-            return false
-        }
+    static func collectNoDescButtons(in element: AXUIElement, width: Int, height: Int, into buttons: inout [AXUIElement]) {
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String,
+           role == kAXButtonRole as String {
 
-        // Determine button offset: Prev=0, Play=1, Next=2 relative to Play position
-        let buttonOffset: Int
-        if descriptions.contains("Previous") {
-            buttonOffset = -1
-        } else if descriptions.contains("Next") {
-            buttonOffset = 1
-        } else {
-            buttonOffset = 0  // Play/Pause
-        }
+            // Check if no description
+            var descRef: CFTypeRef?
+            var hasDesc = false
+            if AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef) == .success,
+               let desc = descRef as? String,
+               !desc.isEmpty {
+                hasDesc = true
+            }
 
-        // Try direct paths in order (fastest first)
-        if let (button, path) = tryDirectPath(window: window, buttonOffset: buttonOffset) {
-            debug("using direct path '\(path)'")
-            let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
-            if result == .success {
-                return true
+            if !hasDesc {
+                var sizeRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+                   let sizeValue = sizeRef {
+                    var size = CGSize.zero
+                    if AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
+                        if abs(Int(size.width) - width) <= 3 && abs(Int(size.height) - height) <= 3 {
+                            buttons.append(element)
+                        }
+                    }
+                }
             }
         }
 
-        // Fallback to recursive search
-        debug("falling back to recursive search")
-        if let button = findTransportButton(in: window, matching: descriptions) {
-            let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
-            if result == .success {
-                return true
-            } else {
-                fputs("error: Failed to press button (code: \(result.rawValue))\n", stderr)
-                return false
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                collectNoDescButtons(in: child, width: width, height: height, into: &buttons)
             }
         }
-
-        fputs("error: Button not found\n", stderr)
-        return false
     }
 
-    static func clickFavoriteButton() -> Bool {
-        guard let window = findJPlayWindow() else {
-            return false
-        }
+    static func findButtonBySize(in element: AXUIElement, minWidth: Int, minHeight: Int, maxWidth: Int, maxHeight: Int, callback: (AXUIElement) -> Void) {
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String,
+           role == kAXButtonRole as String {
 
-        // Favorite button descriptions (changes based on state)
-        let descriptions = [
-            "Not Favorite, tap to mark as favorite.",
-            "Is Favorite, tap to unfavorite."
-        ]
-
-        // Try direct paths first
-        if let (button, path) = tryFavoritePath(window: window) {
-            debug("using favorite path '\(path)'")
-            let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
-            if result == .success {
-                return true
+            var sizeRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+               let sizeValue = sizeRef {
+                var size = CGSize.zero
+                if AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
+                    let w = Int(size.width)
+                    let h = Int(size.height)
+                    if w >= minWidth && w <= maxWidth && h >= minHeight && h <= maxHeight {
+                        callback(element)
+                        return
+                    }
+                }
             }
         }
 
-        // Fallback to recursive search
-        debug("falling back to recursive search for favorite")
-        if let button = findFavoriteButton(in: window, matching: descriptions) {
-            let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
-            if result == .success {
-                return true
-            } else {
-                fputs("error: Failed to press favorite button (code: \(result.rawValue))\n", stderr)
-                return false
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                findButtonBySize(in: child, minWidth: minWidth, minHeight: minHeight, maxWidth: maxWidth, maxHeight: maxHeight, callback: callback)
             }
         }
-
-        fputs("error: Favorite button not found\n", stderr)
-        return false
     }
 
-    static func tryFavoritePath(window: AXUIElement) -> (AXUIElement, String)? {
-        let descriptions = [
-            "Not Favorite, tap to mark as favorite.",
-            "Is Favorite, tap to unfavorite."
-        ]
+    static func findFirstButtonNoDesc(in element: AXUIElement, width: Int, height: Int) -> AXUIElement? {
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String,
+           role == kAXButtonRole as String {
 
-        // Path 1: Album view - transport bar favorite button
-        // Near transport at [0, 0, 3], favorite is likely a sibling
-        if let group = followPath(window, path: [0, 0, 3]) {
-            // Scan for favorite button in this group
-            if let button = findButtonInGroupByDesc(group, matching: descriptions) {
-                return (button, "album")
+            // Check if no description or empty description
+            var descRef: CFTypeRef?
+            var hasDesc = false
+            if AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef) == .success,
+               let desc = descRef as? String,
+               !desc.isEmpty {
+                hasDesc = true
+            }
+
+            if !hasDesc {
+                var sizeRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+                   let sizeValue = sizeRef {
+                    var size = CGSize.zero
+                    if AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
+                        // Allow some tolerance
+                        if abs(Int(size.width) - width) <= 2 && abs(Int(size.height) - height) <= 2 {
+                            return element
+                        }
+                    }
+                }
             }
         }
 
-        // Path 2: Now Playing - favorite near transport at [0,0,1,0,6]
-        // Check parent group [0,0,1,0] for favorite
-        if let group = followPath(window, path: [0, 0, 1, 0]) {
-            if let button = findButtonInGroupByDesc(group, matching: descriptions) {
-                return (button, "nowplaying")
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                if let found = findFirstButtonNoDesc(in: child, width: width, height: height) {
+                    return found
+                }
             }
         }
 
         return nil
     }
 
-    static func findButtonInGroupByDesc(_ group: AXUIElement, matching descriptions: [String]) -> AXUIElement? {
-        var childrenRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(group, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-              let children = childrenRef as? [AXUIElement] else {
-            return nil
+    static func findTextField(in element: AXUIElement) -> AXUIElement? {
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String,
+           role == kAXTextFieldRole as String {
+            return element
         }
-        // Check all children (including nested)
-        for child in children {
-            if isButtonWithDesc(child, matching: descriptions) {
-                return child
-            }
-            // Check one level of nesting
-            var nestedRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(child, kAXChildrenAttribute as CFString, &nestedRef) == .success,
-               let nested = nestedRef as? [AXUIElement] {
-                for nestedChild in nested {
-                    if isButtonWithDesc(nestedChild, matching: descriptions) {
-                        return nestedChild
-                    }
+
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                if let found = findTextField(in: child) {
+                    return found
                 }
             }
         }
+
+        return nil
+    }
+
+    static func findButtonByDesc(in element: AXUIElement, matching descriptions: [String]) -> AXUIElement? {
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String,
+           role == kAXButtonRole as String {
+
+            var descRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef) == .success,
+               let desc = descRef as? String,
+               descriptions.contains(desc) {
+                return element
+            }
+        }
+
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                if let found = findButtonByDesc(in: child, matching: descriptions) {
+                    return found
+                }
+            }
+        }
+
         return nil
     }
 
@@ -286,102 +658,6 @@ struct JPlayCtl {
             }
         }
 
-        return nil
-    }
-
-    static func getChild(_ element: AXUIElement, at index: Int) -> AXUIElement? {
-        var childrenRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-              let children = childrenRef as? [AXUIElement],
-              index >= 0 && index < children.count else {
-            return nil
-        }
-        return children[index]
-    }
-
-    static func followPath(_ element: AXUIElement, path: [Int]) -> AXUIElement? {
-        var current = element
-        for index in path {
-            guard let next = getChild(current, at: index) else {
-                return nil
-            }
-            current = next
-        }
-        return current
-    }
-
-    static func isButtonWithDesc(_ element: AXUIElement, matching descriptions: [String]) -> Bool {
-        var roleRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
-              let role = roleRef as? String,
-              role == kAXButtonRole as String else {
-            return false
-        }
-
-        var descRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef) == .success,
-              let desc = descRef as? String,
-              descriptions.contains(desc) else {
-            return false
-        }
-
-        return true
-    }
-
-    static func tryDirectPath(window: AXUIElement, buttonOffset: Int) -> (AXUIElement, String)? {
-        let targetDesc = buttonOffset == -1 ? ["Previous"] : buttonOffset == 1 ? ["Next"] : ["Play", "Pause"]
-
-        // Path 1: Album view - transport bar at bottom
-        // Group[0] > Group[0] > Group[3] > Button[1/2/3]
-        if let group = followPath(window, path: [0, 0, 3]) {
-            let buttonIndex = 2 + buttonOffset  // Prev=1, Play=2, Next=3
-            if let button = getChild(group, at: buttonIndex),
-               isButtonWithDesc(button, matching: targetDesc) {
-                return (button, "album")
-            }
-        }
-
-        // Path 2: Lounge - Group[0] > Group[0] > Button[9/10/11]
-        if let group = followPath(window, path: [0, 0]) {
-            let buttonIndex = 10 + buttonOffset
-            if let button = getChild(group, at: buttonIndex),
-               isButtonWithDesc(button, matching: targetDesc) {
-                return (button, "lounge")
-            }
-        }
-
-        // Path 3: Now Playing - Group[0] > Group[0] > Group[1] > Group[0] > Group[6] > Button[0/1/2]
-        if let group = followPath(window, path: [0, 0, 1, 0, 6]) {
-            let buttonIndex = 1 + buttonOffset
-            if let button = getChild(group, at: buttonIndex),
-               isButtonWithDesc(button, matching: targetDesc) {
-                return (button, "nowplaying")
-            }
-        }
-
-        // Path 4: Default mini bar
-        // Group[0] > Group[0] > Group[1] > Group[0] > Group[0] > Group[0] > Group[1]
-        if let group = followPath(window, path: [0, 0, 1, 0, 0, 0, 1]) {
-            if let button = findButtonInGroup(group, matching: targetDesc) {
-                return (button, "default")
-            }
-        }
-
-        return nil
-    }
-
-    static func findButtonInGroup(_ group: AXUIElement, matching descriptions: [String]) -> AXUIElement? {
-        var childrenRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(group, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-              let children = childrenRef as? [AXUIElement] else {
-            return nil
-        }
-        // Only check first 10 children max
-        for i in 0..<min(10, children.count) {
-            if isButtonWithDesc(children[i], matching: descriptions) {
-                return children[i]
-            }
-        }
         return nil
     }
 
@@ -480,67 +756,6 @@ struct JPlayCtl {
         }
     }
 
-    static func inspectGroup() {
-        guard let window = findJPlayWindow() else { return }
-
-        // Inspect the default path group
-        print("Default path [0,0,1,0,0,0,1]:")
-        if let group = followPath(window, path: [0, 0, 1, 0, 0, 0, 1]) {
-            printChildren(of: group)
-        } else {
-            print("  (path not found)")
-        }
-
-        print("\nLounge path [0,0]:")
-        if let group = followPath(window, path: [0, 0]) {
-            printChildren(of: group, startIndex: 8, count: 6)
-        } else {
-            print("  (path not found)")
-        }
-
-        print("\nNow Playing path [0,0,1,0,6]:")
-        if let group = followPath(window, path: [0, 0, 1, 0, 6]) {
-            printChildren(of: group)
-        } else {
-            print("  (path not found)")
-        }
-    }
-
-    static func printChildren(of element: AXUIElement, startIndex: Int = 0, count: Int = 10) {
-        var childrenRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-              let children = childrenRef as? [AXUIElement] else {
-            print("  (no children)")
-            return
-        }
-
-        guard startIndex < children.count else {
-            print("  (startIndex \(startIndex) exceeds \(children.count) children)")
-            return
-        }
-
-        let endIndex = min(startIndex + count, children.count)
-        for i in startIndex..<endIndex {
-            let child = children[i]
-            var roleRef: CFTypeRef?
-            var descRef: CFTypeRef?
-            var role = "?"
-            var desc = ""
-
-            if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleRef) == .success,
-               let r = roleRef as? String {
-                role = r.replacingOccurrences(of: "AX", with: "")
-            }
-            if AXUIElementCopyAttributeValue(child, kAXDescriptionAttribute as CFString, &descRef) == .success,
-               let d = descRef as? String {
-                desc = d
-            }
-
-            print("  [\(i)] \(role): \(desc)")
-        }
-        print("  (total: \(children.count) children)")
-    }
-
     static func detectView() {
         guard let window = findJPlayWindow() else { return }
         var buttons: [(desc: String, width: Int, height: Int)] = []
@@ -573,13 +788,13 @@ struct JPlayCtl {
 
                 // Verify it's a transport button by size:
                 // - Min 25px (filters out tiny 12x14 icons)
-                // - Max 50px width (filters out album Play button which is 85px)
+                // - Max 70px width (includes large 60px buttons, filters out 85px album Play)
                 var sizeRef: CFTypeRef?
                 if AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
                    let sizeValue = sizeRef {
                     var size = CGSize.zero
                     if AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
-                        if size.width >= 25 && size.width <= 50 && size.height >= 20 {
+                        if size.width >= 25 && size.width <= 70 && size.height >= 20 {
                             return element
                         }
                     }
