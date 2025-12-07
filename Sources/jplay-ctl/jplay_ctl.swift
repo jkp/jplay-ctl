@@ -16,15 +16,13 @@ protocol JPlayView {
 
 // MARK: - Views
 
-/// Search view - has text field, NO large transport, NO 646 element
+/// Search view - has text field, NO large transport
 struct SearchView: JPlayView {
     static func matches(window: AXUIElement) -> Bool {
         // Must have text field
         guard JPlayCtl.findTextField(in: window) != nil else { return false }
         // Must NOT have large transport (that's NowPlaying/Sofa)
         guard !JPlayCtl.hasLargeTransport(in: window) else { return false }
-        // Must NOT have 646x646 element (that's Sofa)
-        guard !SofaView.has646Element(window: window) else { return false }
         return true
     }
 
@@ -120,11 +118,11 @@ struct LibraryView: JPlayView {
     }
 }
 
-/// Now Playing view - has 27x33 chevron, large transport, no 646x646 element
+/// Now Playing view - has 27x33 chevron, large transport, no "Upcoming" label
 struct NowPlayingView: JPlayView {
     static func matches(window: AXUIElement) -> Bool {
-        // Must have large transport (>50px) but NOT 646x646 element (that's Sofa)
-        guard !SofaView.has646Element(window: window) else { return false }
+        // Must have large transport (>50px) but NOT "Upcoming" label (that's Sofa)
+        guard !SofaView.hasUpcomingLabel(window: window) else { return false }
         return JPlayCtl.hasLargeTransport(in: window)
     }
 
@@ -161,18 +159,14 @@ struct NowPlayingView: JPlayView {
     }
 }
 
-/// Sofa view - has 646x646 element, large transport, CLEAR button (queue panel)
+/// Sofa view - has "Upcoming" queue panel + large transport
 struct SofaView: JPlayView {
     static func matches(window: AXUIElement) -> Bool {
-        has646Element(window: window) && JPlayCtl.hasLargeTransport(in: window)
+        hasUpcomingLabel(window: window) && JPlayCtl.hasLargeTransport(in: window)
     }
 
-    static func has646Element(window: AXUIElement) -> Bool {
-        var found = false
-        JPlayCtl.findElementBySize(in: window, width: 646, height: 646, tolerance: 5) { _ in
-            found = true
-        }
-        return found
+    static func hasUpcomingLabel(window: AXUIElement) -> Bool {
+        JPlayCtl.hasTextElement(in: window, matching: "Upcoming")
     }
 
     func canPerform(_ action: JPlayAction, window: AXUIElement) -> Bool {
@@ -253,15 +247,15 @@ struct JPlayCtl {
                 return view.perform(action, window: window)
             }
 
-            // Escape and poll until action becomes available
+            // Escape and wait for view change, then loop to re-evaluate
             debug("escaping from \(viewName)")
             guard view.escape(window: window) else {
                 debug("escape failed")
                 return false
             }
 
-            guard waitUntilActionAvailable(action, timeout: timeout) else {
-                debug("timeout waiting for action")
+            guard waitForViewChange(from: viewType, timeout: timeout) else {
+                debug("timeout waiting for view change")
                 return false
             }
         }
@@ -279,7 +273,7 @@ struct JPlayCtl {
         }
     }
 
-    static func waitUntilActionAvailable(_ action: JPlayAction, timeout: Double) -> Bool {
+    static func waitForViewChange(from originalView: JPlayView.Type, timeout: Double) -> Bool {
         let start = Date()
         var pollCount = 0
         while Date().timeIntervalSince(start) < timeout {
@@ -287,13 +281,12 @@ struct JPlayCtl {
             pollCount += 1
             for viewType in views {
                 if viewType.matches(window: window) {
-                    let view = createView(viewType)
-                    if view.canPerform(action, window: window) {
+                    // View changed or stabilized - let main loop decide what to do
+                    if viewType != originalView {
                         let viewName = String(describing: viewType).replacingOccurrences(of: ".Type", with: "")
-                        debug("poll \(pollCount): \(viewName) ready")
-                        return true
+                        debug("poll \(pollCount): changed to \(viewName)")
                     }
-                    break
+                    return true
                 }
             }
             usleep(50000)  // 50ms poll
@@ -351,6 +344,31 @@ struct JPlayCtl {
         }
     }
 
+    static func hasTextElement(in window: AXUIElement, matching text: String) -> Bool {
+        var found = false
+        findTextElement(in: window, matching: text) { _ in found = true }
+        return found
+    }
+
+    static func findTextElement(in element: AXUIElement, matching text: String, callback: (AXUIElement) -> Void) {
+        // Check description attribute for matching text
+        var descRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef) == .success,
+           let desc = descRef as? String,
+           desc == text {
+            callback(element)
+            return
+        }
+
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                findTextElement(in: child, matching: text, callback: callback)
+            }
+        }
+    }
+
     static func main() {
         var args = Array(CommandLine.arguments.dropFirst())
 
@@ -387,6 +405,10 @@ struct JPlayCtl {
             exit(0)
         case "trace":
             traceButtonPath()
+            exit(0)
+        case "find-text":
+            let pattern = args.count > 1 ? args[1] : ""
+            findTextElements(pattern: pattern)
             exit(0)
         default:
             fputs("Unknown command: \(command)\n", stderr)
@@ -703,6 +725,35 @@ struct JPlayCtl {
            let children = childrenRef as? [AXUIElement] {
             for child in children {
                 collectButtons(in: child, into: &buttons)
+            }
+        }
+    }
+
+    static func findTextElements(pattern: String) {
+        guard let window = findJPlayWindow() else { return }
+        collectTextElements(in: window, pattern: pattern.lowercased())
+    }
+
+    static func collectTextElements(in element: AXUIElement, pattern: String) {
+        // Check value, title, description attributes
+        for attr in [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute] as [CFString] {
+            var ref: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, attr, &ref) == .success,
+               let str = ref as? String,
+               !str.isEmpty,
+               (pattern.isEmpty || str.lowercased().contains(pattern)) {
+                var roleRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+                let role = roleRef as? String ?? "?"
+                print("[\(role)] \(attr): \(str)")
+            }
+        }
+
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                collectTextElements(in: child, pattern: pattern)
             }
         }
     }
