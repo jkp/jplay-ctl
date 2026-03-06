@@ -41,19 +41,19 @@ struct SearchView: JPlayView {
         case .toggleLike:
             return JPlayCtl.clickFavoriteInWindow(window)
         case .search:
-            // Focus the search text field by clicking it
             if let textField = JPlayCtl.findTextField(in: window) {
-                if AXUIElementPerformAction(textField, kAXPressAction as CFString) == .success {
-                    JPlayCtl.debug("clicked text field")
-                } else {
-                    AXUIElementSetAttributeValue(textField, kAXFocusedAttribute as CFString, true as CFTypeRef)
-                    JPlayCtl.debug("set focus attribute")
-                }
+                // Activate the app first so it can receive focus
                 if let pid = JPlayCtl.findUPnPPlayerPID() {
                     let app = NSRunningApplication(processIdentifier: pid)
                     app?.activate(options: .activateIgnoringOtherApps)
+                    usleep(100_000)  // 100ms for activation
                 }
-                return true
+                // Set focus attribute on the text field
+                let focusResult = AXUIElementSetAttributeValue(
+                    textField, kAXFocusedAttribute as CFString, true as CFTypeRef)
+                // Also press to ensure cursor placement
+                let pressResult = AXUIElementPerformAction(textField, kAXPressAction as CFString)
+                return focusResult == .success || pressResult == .success
             }
             return false
         }
@@ -315,11 +315,19 @@ struct JPlayCtl {
     }
 
     static func hasLargeTransport(in window: AXUIElement) -> Bool {
-        var found = false
-        findButtonBySize(in: window, minWidth: 50, minHeight: 50, maxWidth: 70, maxHeight: 70) { _ in
-            found = true
+        // Check actual transport button size, not any button in size range
+        // (track list item buttons at 52x66 were causing false positives)
+        if let playBtn = findTransportButton(in: window, matching: ["Play", "Pause"]) {
+            var sizeRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(playBtn, kAXSizeAttribute as CFString, &sizeRef) == .success,
+               let sizeValue = sizeRef {
+                var size = CGSize.zero
+                if AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
+                    return size.width > 50
+                }
+            }
         }
-        return found
+        return false
     }
 
     static func findElementBySize(in element: AXUIElement, width: Int, height: Int, tolerance: Int, callback: (AXUIElement) -> Void) {
