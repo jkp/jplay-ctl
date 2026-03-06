@@ -46,15 +46,19 @@ struct SearchView: JPlayView {
                 if let pid = JPlayCtl.findUPnPPlayerPID() {
                     let app = NSRunningApplication(processIdentifier: pid)
                     app?.activate(options: .activateIgnoringOtherApps)
+                    JPlayCtl.debug("activated app")
                     usleep(100_000)  // 100ms for activation
                 }
                 // Set focus attribute on the text field
                 let focusResult = AXUIElementSetAttributeValue(
                     textField, kAXFocusedAttribute as CFString, true as CFTypeRef)
+                JPlayCtl.debug("set focus: \(focusResult == .success ? "ok" : "failed (\(focusResult.rawValue))")")
                 // Also press to ensure cursor placement
                 let pressResult = AXUIElementPerformAction(textField, kAXPressAction as CFString)
+                JPlayCtl.debug("press: \(pressResult == .success ? "ok" : "failed (\(pressResult.rawValue))")")
                 return focusResult == .success || pressResult == .success
             }
+            JPlayCtl.error("search text field not found")
             return false
         }
     }
@@ -216,6 +220,10 @@ struct JPlayCtl {
         }
     }
 
+    static func error(_ message: String) {
+        fputs("error: \(message)\n", stderr)
+    }
+
     // MARK: - View Registry & Execute Loop
 
     // Order matters: more specific views first
@@ -232,7 +240,7 @@ struct JPlayCtl {
 
             // Find matching view
             guard let viewType = views.first(where: { $0.matches(window: window) }) else {
-                debug("no view matched for attempt \(attempt)")
+                error("no view matched (attempt \(attempt + 1)/\(maxDepth)); run 'explore' or 'detect' to diagnose")
                 return false
             }
 
@@ -250,16 +258,16 @@ struct JPlayCtl {
             // Escape and wait for view change, then loop to re-evaluate
             debug("escaping from \(viewName)")
             guard view.escape(window: window) else {
-                debug("escape failed")
+                error("escape from \(viewName) failed for action '\(action)'")
                 return false
             }
 
             guard waitForViewChange(from: viewType, timeout: timeout) else {
-                debug("timeout waiting for view change")
+                error("timeout waiting for view change from \(viewName)")
                 return false
             }
         }
-        debug("max depth reached")
+        error("max navigation depth (\(maxDepth)) reached for action '\(action)'")
         return false
     }
 
@@ -315,8 +323,9 @@ struct JPlayCtl {
     }
 
     static func hasLargeTransport(in window: AXUIElement) -> Bool {
-        // Check actual transport button size, not any button in size range
-        // (track list item buttons at 52x66 were causing false positives)
+        // Look for transport buttons (Play/Pause/Next/Previous) that are large (>50px)
+        // This avoids false positives from track list item buttons (52x66) that happen
+        // to fall in the same size range
         if let playBtn = findTransportButton(in: window, matching: ["Play", "Pause"]) {
             var sizeRef: CFTypeRef?
             if AXUIElementCopyAttributeValue(playBtn, kAXSizeAttribute as CFString, &sizeRef) == .success,
@@ -465,29 +474,32 @@ struct JPlayCtl {
 
     static func findJPlayWindow() -> AXUIElement? {
         guard let pid = findUPnPPlayerPID() else {
-            fputs("error: UPnP Player not running\n", stderr)
+            error("UPnP Player not running")
             return nil
         }
 
         let app = AXUIElementCreateApplication(pid)
 
         var windowsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-              let windows = windowsRef as? [AXUIElement] else {
-            fputs("error: Could not get windows\n", stderr)
+        let axResult = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef)
+        guard axResult == .success, let windows = windowsRef as? [AXUIElement] else {
+            error("cannot get windows from pid \(pid) (AXError \(axResult.rawValue)); check accessibility permissions")
             return nil
         }
 
+        var windowTitles: [String] = []
         for window in windows {
             var titleRef: CFTypeRef?
             if AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef) == .success,
-               let title = titleRef as? String,
-               title == "JPLAY" {
-                return window
+               let title = titleRef as? String {
+                if title == "JPLAY" {
+                    return window
+                }
+                windowTitles.append(title)
             }
         }
 
-        fputs("error: JPLAY window not found\n", stderr)
+        error("JPLAY window not found; \(windows.count) window(s) with titles: [\(windowTitles.joined(separator: ", "))]")
         return nil
     }
 
